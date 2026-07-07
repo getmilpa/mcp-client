@@ -1,8 +1,18 @@
+<p align="center">
+  <a href="https://github.com/getmilpa">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/getmilpa/core/main/art/lockup/milpa-lockup-v-color-dark.svg">
+      <img src="https://raw.githubusercontent.com/getmilpa/core/main/art/lockup/milpa-lockup-v-color-light.svg" alt="Milpa" width="300">
+    </picture>
+  </a>
+</p>
+
 # Milpa MCP Client
 
 > An **MCP (Model Context Protocol) client** for PHP — stdio and HTTP/SSE transports, typed tool/resource contracts, and connection management for talking to external MCP servers. `McpClientManager` connects to several servers at once and routes tool calls to the right one by a namespaced registry name.
 
 [![CI](https://github.com/getmilpa/mcp-client/actions/workflows/ci.yml/badge.svg)](https://github.com/getmilpa/mcp-client/actions/workflows/ci.yml)
+[![Packagist](https://img.shields.io/packagist/v/milpa/mcp-client.svg)](https://packagist.org/packages/milpa/mcp-client)
 [![PHP](https://img.shields.io/badge/php-%E2%89%A5%208.3-777bb4.svg)](https://www.php.net/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-API%20reference-blue.svg)](https://getmilpa.github.io/mcp-client/)
@@ -125,8 +135,8 @@ issues via [SECURITY.md](SECURITY.md), and note that this project follows a
 
 ## License
 
-[Apache-2.0](LICENSE) © the Milpa authors.
+[Apache-2.0](LICENSE) © TeamX Agency.
 
 ---
 
-Milpa is designed, built, and maintained by **[TeamX Agency](https://teamx.agency)**.
+Milpa is designed, built, and maintained by **[TeamX Agency](https://teamx.agency/?utm_source=github&utm_medium=readme&utm_campaign=milpa&utm_content=mcp-client)**.
