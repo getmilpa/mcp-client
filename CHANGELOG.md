@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/getmilpa/mcp-client/compare/v0.1.0...v0.2.0) (2026-07-08)
+
+
+### Features
+
+* injectable PSR-18 HTTP client ([f937483](https://github.com/getmilpa/mcp-client/commit/f93748301614db9021a5032298cf599f2df25d83))
+
 ## 0.1.0 (2026-07-07)
 
 
