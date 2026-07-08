@@ -21,8 +21,8 @@
 process act as an **MCP client**, connecting to one or more external MCP servers — local
 ones spawned as subprocesses (stdio) or remote ones over HTTP with Server-Sent Events —
 and discovering, listing, and calling the tools and resources they expose. **No product
-coupling**: its only production dependency is `guzzlehttp/guzzle`, for the HTTP/SSE
-transport.
+coupling**: `HttpSseTransport` speaks HTTP through **PSR-18** (`Psr\Http\Client\ClientInterface`),
+defaulting to `guzzlehttp/guzzle` when no client is injected.
 
 ## Install
 
@@ -80,6 +80,40 @@ $manager->registerServer('remote-docs', [
 `connectAll()` connects every registered server and returns a `[name => Throwable]` map
 of the ones that failed, instead of throwing on the first bad server.
 
+### Bringing your own HTTP client (PSR-18)
+
+`McpClientManager::registerServer()` always builds its own `HttpSseTransport` from the
+config array, so it always gets the default Guzzle client. To inject your own PSR-18
+client — a shared connection pool, a client wrapped with retry/circuit-breaker
+middleware, or a test double — construct `HttpSseTransport` directly and wrap it in a
+`McpConnection` yourself:
+
+```php
+use Milpa\McpClient\McpConnection;
+use Milpa\McpClient\Transports\HttpSseTransport;
+
+$transport = new HttpSseTransport(
+    baseUrl: 'https://mcp.example.com/',
+    headers: ['Authorization' => 'Bearer ' . $token],
+    serverName: 'remote-docs',
+    httpClient: $yourPsr18Client,     // Psr\Http\Client\ClientInterface; omit for Guzzle
+    requestFactory: $yourPsr17Factory, // Psr\Http\Message\RequestFactoryInterface; optional
+    streamFactory: $yourPsr17Factory,  // Psr\Http\Message\StreamFactoryInterface; optional
+    logger: $yourLogger,               // Psr\Log\LoggerInterface; optional, see below
+);
+
+$connection = new McpConnection('remote-docs', $transport);
+$connection->connect();
+```
+
+`$timeout` only configures the *default* Guzzle client — it has no effect once you
+inject your own `$httpClient`, since PSR-18's `sendRequest()` takes no per-call options.
+
+`notify()` (fire-and-forget JSON-RPC notifications) never throws — that's the
+`TransportInterface` contract — but a transport failure during `notify()` is reported to
+`$logger` (at `warning` level) instead of being silently dropped, when a logger is
+injected.
+
 ## What it is
 
 - **`McpClientManager`** — the entry point most callers use. Registers servers from
@@ -93,8 +127,9 @@ of the ones that failed, instead of throwing on the first bad server.
   `notify()` (JSON-RPC notification, no reply expected).
   - **`StdioTransport`** — spawns the server as a subprocess (`proc_open`) and speaks
     newline-delimited JSON-RPC over its stdin/stdout.
-  - **`HttpSseTransport`** — POSTs JSON-RPC over Guzzle and parses the reply whether the
-    server answers with a plain JSON body or a `text/event-stream` SSE payload.
+  - **`HttpSseTransport`** — POSTs JSON-RPC through an injectable PSR-18
+    `ClientInterface` (Guzzle by default) and parses the reply whether the server
+    answers with a plain JSON body or a `text/event-stream` SSE payload.
 - **Typed contracts** — `McpTool`, `McpResource`, and `McpCapabilities` are immutable
   value objects built with `fromArray()` from the server's raw JSON-RPC responses, not
   arrays passed around by convention.
@@ -120,7 +155,11 @@ Every public symbol carries a DocBlock.
 ## Requirements
 
 - PHP **≥ 8.3**
-- [`guzzlehttp/guzzle`](https://packagist.org/packages/guzzlehttp/guzzle) **^7.10** (used by `HttpSseTransport`)
+- [`guzzlehttp/guzzle`](https://packagist.org/packages/guzzlehttp/guzzle) **^7.10** — the
+  default PSR-18 implementation `HttpSseTransport` falls back to when no `ClientInterface`
+  is injected (also brings `guzzlehttp/psr7`, used as the default PSR-17 factory)
+- `psr/http-client`, `psr/http-factory`, `psr/http-message`, `psr/log` — the interfaces
+  `HttpSseTransport`'s constructor is typed against
 
 ## Documentation
 

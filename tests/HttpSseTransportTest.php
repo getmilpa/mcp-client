@@ -25,28 +25,32 @@ use Milpa\McpClient\Contracts\McpConnectionException;
 use Milpa\McpClient\Contracts\McpServerException;
 use Milpa\McpClient\Contracts\McpTransportException;
 use Milpa\McpClient\Transports\HttpSseTransport;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Client\ClientInterface;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\ResponseInterface;
+use Psr\Log\AbstractLogger;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
 
 class HttpSseTransportTest extends TestCase
 {
-    private function createTransportWithMock(MockHandler $mock): HttpSseTransport
+    private function createTransportWithMock(MockHandler $mock, ?LoggerInterface $logger = null): HttpSseTransport
     {
         $handlerStack = HandlerStack::create($mock);
         $client = new Client(['handler' => $handlerStack]);
 
-        $transport = new HttpSseTransport(
+        // Guzzle's Client implements Psr\Http\Client\ClientInterface natively (PSR-18), so the
+        // mock-backed client goes straight through the constructor-injectable seam — no
+        // reflection into private internals needed anymore.
+        return new HttpSseTransport(
             baseUrl: 'http://localhost:8080',
             headers: ['X-Custom' => 'test'],
             timeout: 5,
-            serverName: 'test-server'
+            serverName: 'test-server',
+            httpClient: $client,
+            logger: $logger,
         );
-
-        // Inject mock client via reflection
-        $reflection = new \ReflectionClass($transport);
-        $clientProperty = $reflection->getProperty('client');
-        $clientProperty->setAccessible(true);
-        $clientProperty->setValue($transport, $client);
-
-        return $transport;
     }
 
     public function testConstructorSetsProperties(): void
@@ -697,5 +701,141 @@ class HttpSseTransportTest extends TestCase
         $this->assertTrue($result['empty_params']);
         // The raw JSON should contain empty object {} not empty array []
         $this->assertStringContainsString('"params":{}', $capturedBody);
+    }
+
+    // ========== PSR-18 seam: fake ClientInterface, no network, no Guzzle internals ==========
+
+    public function testRequestGoesThroughAnInjectedPsr18ClientVerbatim(): void
+    {
+        $response = new Response(200, ['Content-Type' => 'application/json'], (string) json_encode([
+            'jsonrpc' => '2.0',
+            'id' => 1,
+            'result' => ['via' => 'fake-psr18-client'],
+        ]));
+
+        $fakeClient = new FakeHttpClient($response);
+
+        $transport = new HttpSseTransport(
+            baseUrl: 'http://example.test',
+            headers: ['X-Custom' => 'test'],
+            serverName: 'fake-server',
+            httpClient: $fakeClient,
+        );
+
+        $result = $transport->request('tools/list', ['foo' => 'bar']);
+
+        $this->assertSame(['via' => 'fake-psr18-client'], $result);
+
+        $sent = $fakeClient->lastRequest;
+        $this->assertNotNull($sent);
+        $this->assertSame('POST', $sent->getMethod());
+        $this->assertSame('http://example.test/', (string) $sent->getUri());
+        $this->assertSame('application/json', $sent->getHeaderLine('Content-Type'));
+        $this->assertSame('application/json, text/event-stream', $sent->getHeaderLine('Accept'));
+        $this->assertSame('test', $sent->getHeaderLine('X-Custom'));
+
+        $sentPayload = json_decode((string) $sent->getBody(), true);
+        $this->assertSame('tools/list', $sentPayload['method']);
+        $this->assertSame(['foo' => 'bar'], $sentPayload['params']);
+    }
+
+    public function testRequestWrapsPsr18ClientExceptionInMcpTransportException(): void
+    {
+        $fakeClient = new FakeHttpClient(new FakeClientException('network is down'));
+
+        $transport = new HttpSseTransport(
+            baseUrl: 'http://example.test',
+            serverName: 'fake-server',
+            httpClient: $fakeClient,
+        );
+
+        $this->expectException(McpTransportException::class);
+        $this->expectExceptionMessage('HTTP request failed');
+
+        $transport->request('test/method', []);
+    }
+
+    public function testNotifyLogsPsr18ClientFailureInsteadOfSwallowingSilently(): void
+    {
+        $exception = new FakeClientException('boom');
+        $fakeClient = new FakeHttpClient($exception);
+        $logger = new RecordingLogger();
+
+        $transport = new HttpSseTransport(
+            baseUrl: 'http://example.test',
+            serverName: 'fake-server',
+            httpClient: $fakeClient,
+            logger: $logger,
+        );
+
+        // Fire-and-forget contract preserved: still no exception out of notify().
+        $transport->notify('notifications/progress', ['progress' => 1]);
+
+        $this->assertCount(1, $logger->records);
+        $this->assertSame(LogLevel::WARNING, $logger->records[0]['level']);
+        $this->assertSame('notifications/progress', $logger->records[0]['context']['method']);
+        $this->assertSame($exception, $logger->records[0]['context']['exception']);
+    }
+
+    public function testNotifyStillDoesNotThrowWhenNoLoggerIsInjected(): void
+    {
+        $fakeClient = new FakeHttpClient(new FakeClientException('boom'));
+
+        $transport = new HttpSseTransport(
+            baseUrl: 'http://example.test',
+            serverName: 'fake-server',
+            httpClient: $fakeClient,
+        );
+
+        $transport->notify('notifications/progress', ['progress' => 1]);
+
+        $this->assertTrue(true); // Reaching here means notify() did not throw.
+    }
+}
+
+/**
+ * Minimal PSR-18 test double — proves the seam works with ANY `ClientInterface`, not just
+ * Guzzle's (which the rest of this suite exercises via `MockHandler`, itself a real PSR-18
+ * client). No network, no Guzzle HTTP internals: this class only speaks PSR-7/PSR-18.
+ */
+final class FakeHttpClient implements ClientInterface
+{
+    public ?RequestInterface $lastRequest = null;
+
+    public function __construct(
+        private readonly ResponseInterface|ClientExceptionInterface|null $result = null,
+    ) {
+    }
+
+    public function sendRequest(RequestInterface $request): ResponseInterface
+    {
+        $this->lastRequest = $request;
+
+        if ($this->result instanceof ClientExceptionInterface) {
+            throw $this->result;
+        }
+
+        return $this->result ?? new Response(200, ['Content-Type' => 'application/json'], '{}');
+    }
+}
+
+/**
+ * Minimal PSR-18 client exception test double.
+ */
+final class FakeClientException extends \RuntimeException implements ClientExceptionInterface
+{
+}
+
+/**
+ * Minimal PSR-3 logger test double that records every call instead of writing anywhere.
+ */
+final class RecordingLogger extends AbstractLogger
+{
+    /** @var list<array{level: mixed, message: string, context: array<string, mixed>}> */
+    public array $records = [];
+
+    public function log($level, string|\Stringable $message, array $context = []): void
+    {
+        $this->records[] = ['level' => $level, 'message' => (string) $message, 'context' => $context];
     }
 }

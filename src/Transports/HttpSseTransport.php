@@ -15,11 +15,17 @@ declare(strict_types=1);
 namespace Milpa\McpClient\Transports;
 
 use GuzzleHttp\Client;
-use GuzzleHttp\Exception\GuzzleException;
+use GuzzleHttp\Psr7\HttpFactory;
 use Milpa\McpClient\Contracts\McpConnectionException;
 use Milpa\McpClient\Contracts\McpServerException;
 use Milpa\McpClient\Contracts\McpTransportException;
 use Milpa\McpClient\Contracts\TransportInterface;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Client\ClientInterface;
+use Psr\Http\Message\RequestFactoryInterface;
+use Psr\Http\Message\RequestInterface;
+use Psr\Http\Message\StreamFactoryInterface;
+use Psr\Log\LoggerInterface;
 
 /**
  * HTTP/SSE Transport for MCP servers.
@@ -29,37 +35,59 @@ use Milpa\McpClient\Contracts\TransportInterface;
  * 1. Client sends JSON-RPC request via HTTP POST
  * 2. Server responds via Server-Sent Events (SSE) or direct JSON response
  *
+ * Every exchange is a single buffered POST/response — the "SSE" side is just an alternate
+ * `Content-Type` this class parses out of an already-fully-read body (see
+ * {@see parseSseResponse()}); there is no long-lived streamed connection. That is what makes
+ * the whole request/notify path a clean fit for PSR-18's `ClientInterface`: nothing here needs
+ * chunked/incremental reads that `ClientInterface::sendRequest()` couldn't give us.
+ *
  * @see https://modelcontextprotocol.io/docs/concepts/transports#http-with-sse
  */
 class HttpSseTransport implements TransportInterface
 {
-    private Client $client;
+    private readonly ClientInterface $httpClient;
+    private readonly RequestFactoryInterface $requestFactory;
+    private readonly StreamFactoryInterface $streamFactory;
+    private readonly string $endpointUrl;
     private bool $connected = false;
     private int $requestId = 0;
 
     /**
-     * @param string                $baseUrl    Base URL of the MCP server
-     * @param array<string, string> $headers    Additional HTTP headers
-     * @param int                   $timeout    Request timeout in seconds
-     * @param string|null           $serverName Server name for error messages
+     * @param string                       $baseUrl        Base URL of the MCP server
+     * @param array<string, string>        $headers        Additional HTTP headers
+     * @param int                          $timeout        Request timeout in seconds; only
+     *                                                     applied when `$httpClient` is
+     *                                                     omitted (it configures the default
+     *                                                     Guzzle client this class builds)
+     * @param string|null                  $serverName     Server name for error messages
+     * @param ClientInterface|null         $httpClient     PSR-18 HTTP client; defaults to a
+     *                                                     Guzzle client configured with
+     *                                                     `$timeout`
+     * @param RequestFactoryInterface|null $requestFactory PSR-17 request factory; defaults to
+     *                                                     `GuzzleHttp\Psr7\HttpFactory`
+     * @param StreamFactoryInterface|null  $streamFactory  PSR-17 stream factory; defaults to
+     *                                                     `GuzzleHttp\Psr7\HttpFactory`
+     * @param LoggerInterface|null         $logger         Optional logger for notify() failures
+     *                                                     (notifications are fire-and-forget
+     *                                                     per {@see TransportInterface::notify()},
+     *                                                     so failures are logged, not thrown)
      */
     public function __construct(
         private readonly string $baseUrl,
         private readonly array $headers = [],
         private readonly int $timeout = 30,
         private readonly ?string $serverName = null,
+        ?ClientInterface $httpClient = null,
+        ?RequestFactoryInterface $requestFactory = null,
+        ?StreamFactoryInterface $streamFactory = null,
+        private readonly ?LoggerInterface $logger = null,
     ) {
-        $defaultHeaders = [
-            'Content-Type' => 'application/json',
-            'Accept' => 'application/json, text/event-stream',
-        ];
+        $this->endpointUrl = rtrim($this->baseUrl, '/') . '/';
+        $this->httpClient = $httpClient ?? new Client(['timeout' => $this->timeout]);
 
-        $this->client = new Client([
-            'base_uri' => rtrim($this->baseUrl, '/') . '/',
-            'timeout' => $this->timeout,
-            'headers' => array_merge($defaultHeaders, $this->headers),
-            'http_errors' => false,
-        ]);
+        $psr17Factory = new HttpFactory();
+        $this->requestFactory = $requestFactory ?? $psr17Factory;
+        $this->streamFactory = $streamFactory ?? $psr17Factory;
     }
 
     /**
@@ -124,9 +152,7 @@ class HttpSseTransport implements TransportInterface
         ];
 
         try {
-            $response = $this->client->post('', [
-                'json' => $payload,
-            ]);
+            $response = $this->httpClient->sendRequest($this->buildJsonRpcRequest($payload));
 
             $statusCode = $response->getStatusCode();
             $contentType = $response->getHeaderLine('Content-Type');
@@ -156,7 +182,7 @@ class HttpSseTransport implements TransportInterface
                 $this->serverName
             );
 
-        } catch (GuzzleException $e) {
+        } catch (ClientExceptionInterface $e) {
             throw new McpTransportException(
                 "HTTP request failed: " . $e->getMessage(),
                 $this->serverName,
@@ -169,6 +195,10 @@ class HttpSseTransport implements TransportInterface
     /**
      * POST a JSON-RPC notification; the response, if any, is discarded.
      *
+     * Per {@see TransportInterface::notify()}, notifications are fire-and-forget — the
+     * interface declares no `@throws`, and callers (e.g. {@see connect()}) rely on that. A
+     * transport failure here is therefore logged, not thrown, so it isn't silently dropped.
+     *
      * @param array<string, mixed> $params
      */
     public function notify(string $method, array $params = []): void
@@ -180,13 +210,44 @@ class HttpSseTransport implements TransportInterface
         ];
 
         try {
-            $this->client->post('', [
-                'json' => $payload,
+            $this->httpClient->sendRequest($this->buildJsonRpcRequest($payload));
+        } catch (ClientExceptionInterface $e) {
+            $this->logger?->warning('MCP notification "{method}" failed: {message}', [
+                'method' => $method,
+                'message' => $e->getMessage(),
+                'exception' => $e,
+                'serverName' => $this->serverName,
             ]);
-        } catch (GuzzleException $e) {
-            // Notifications don't require response, but log error
-            // Could add logging here if needed
         }
+    }
+
+    /**
+     * Build the PSR-7 JSON-RPC POST request shared by {@see request()} and {@see notify()}.
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function buildJsonRpcRequest(array $payload): RequestInterface
+    {
+        $request = $this->requestFactory
+            ->createRequest('POST', $this->endpointUrl)
+            ->withBody($this->streamFactory->createStream((string) json_encode($payload)));
+
+        foreach ($this->defaultHeaders() as $name => $value) {
+            $request = $request->withHeader($name, $value);
+        }
+
+        return $request;
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function defaultHeaders(): array
+    {
+        return array_merge([
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json, text/event-stream',
+        ], $this->headers);
     }
 
     /**
