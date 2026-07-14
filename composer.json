@@ -3,6 +3,12 @@
   "description": "MCP (Model Context Protocol) client for the Milpa PHP framework: stdio and HTTP/SSE transports, JSON-RPC framing, capability negotiation, and tool/resource discovery for connecting to external MCP servers.",
   "type": "library",
   "license": "Apache-2.0",
+  "authors": [
+    {
+      "name": "Rodrigo Vicente - TeamX Agency",
+      "homepage": "https://teamx.agency"
+    }
+  ],
   "require": {
     "php": ">=8.3",
     "guzzlehttp/guzzle": "^7.10",
